@@ -1,12 +1,13 @@
 import streamlit as st
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import boto3
 import requests
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 import pandas as pd
+import shutil
 
 # Load environment variables
 load_dotenv()
@@ -90,23 +91,12 @@ def parse_video_metadata(video_data):
         upload_date = case.get('uploadDate', 'N/A')
         duration = case.get('videoDurationSeconds', 0)
         
-		# Extract users/surgeon EMR IDs (list of strings like ["EMRID1", "EMRID2"])
+        # Extract users/surgeon EMR IDs (list of strings like ["EMRID1", "EMRID2"])
         users = case.get('users', [])
         if isinstance(users, list) and users:
             surgeon_id_str = ', '.join(users)
         else:
             surgeon_id_str = 'N/A'
-        
-        # Check if users is a dictionary or list
-        if isinstance(users, dict):
-            for key, value in users.items():
-                if key.startswith('EMRID') and value:
-                    surgeon_ids.append(f"{key}: {value}")
-        elif isinstance(users, list):
-            # If users is a list, just join them
-            surgeon_ids = [str(u) for u in users if u]
-        
-        surgeon_id_str = ', '.join(surgeon_ids) if surgeon_ids else 'N/A'
         
         # Process each media file
         for media in case.get('mediaFiles', []):
@@ -136,13 +126,47 @@ def parse_video_metadata(video_data):
                 'case_date': case_date,
                 'upload_date': upload_date,
                 'surgeon_ids': surgeon_id_str,
-                'users': users,  # Keep raw users dict for filtering
+                'users': users,  # Keep raw users list for filtering
                 'start_time': start_time.split('T')[1] if 'T' in start_time else start_time,
                 'end_time': end_time.split('T')[1] if 'T' in end_time else end_time,
                 'duration_seconds': duration
             })
     
     return videos
+
+def download_video_from_s3(s3_key, local_path):
+    """Download video from S3 to local path"""
+    try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        s3_client.download_file(S3_BUCKET_NAME, s3_key, local_path)
+        return True
+    except Exception as e:
+        st.error(f"Error downloading video: {e}")
+        return False
+
+def export_videos_to_directory(video_list, destination_dir):
+    """Copy downloaded videos to export directory"""
+    if not os.path.exists(destination_dir):
+        st.error(f"Destination directory does not exist: {destination_dir}")
+        return 0, len(video_list)
+    
+    exported = 0
+    failed = 0
+    
+    for video in video_list:
+        try:
+            local_path = f"data/temp_videos/{video['filename']}"
+            if os.path.exists(local_path):
+                dest_path = os.path.join(destination_dir, video['filename'])
+                shutil.copy2(local_path, dest_path)
+                exported += 1
+            else:
+                failed += 1
+        except Exception as e:
+            st.error(f"Error copying {video['filename']}: {e}")
+            failed += 1
+    
+    return exported, failed
 
 # Initialize session state
 if 'video_list' not in st.session_state:
@@ -174,22 +198,16 @@ with st.sidebar:
     st.subheader("Filters")
     surgeon_ids = st.text_area(
         "Surgeon EMR IDs (one per line):",
-        placeholder="12345\n67890\n11223",
+        placeholder="EMRID1\nEMRID2\nEMRID3",
         help="Leave empty to fetch all surgeons"
-    )
-    
-    use_case_date = st.checkbox(
-        "Filter by case date (not upload date)",
-        value=True,
-        help="When checked, date range filters by when surgery occurred, not when video was uploaded"
     )
     
     st.divider()
     
-    # Date range selection
+    # Date range selection (default: last 7 days)
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input("Start Date", value=datetime.now().date())
+        start_date = st.date_input("Start Date", value=(datetime.now() - timedelta(days=7)).date())
     with col2:
         end_date = st.date_input("End Date", value=datetime.now().date())
     
@@ -213,36 +231,21 @@ with st.sidebar:
                 if video_data:
                     all_videos = parse_video_metadata(video_data)
                     
-					# Filter by surgeon ID if specified
+                    # Filter by surgeon ID if specified
                     if surgeon_list:
                         filtered_videos = []
                         for v in all_videos:
                             video_users = v.get('users', [])
-                            
-							# Check if any of the surgeon IDs match any user in the video
+                            # Check if any of the surgeon IDs match any user in the video
                             if isinstance(video_users, list):
-                                if any(surgeon_id in video_user for surgeon_id in surgeon_list for video_user in video_users):
+                                if any(surgeon_id in video_users for surgeon_id in surgeon_list):
                                     filtered_videos.append(v)
-                            else:
-                                filtered_videos.append(v)
-
-                            # Get user values based on type
-                            if isinstance(users, dict):
-                                user_values = [val for key, val in users.items() if key.startswith('EMRID')]
-                            elif isinstance(users, list):
-                                user_values = users
-                            else:
-                                user_values = []
-                            
-                            if any(surgeon_id in str(val) for val in user_values for surgeon_id in surgeon_list):
-                                filtered_videos.append(v)
                     else:
                         filtered_videos = all_videos
                     
-                    # Filter by case date if selected
-                    if use_case_date:
-                        filtered_videos = [v for v in filtered_videos
-                                         if start_str <= v.get('case_date', '') <= end_str]
+                    # Always filter by case date
+                    filtered_videos = [v for v in filtered_videos
+                                     if start_str <= v.get('case_date', '') <= end_str]
                     
                     st.session_state.video_list = filtered_videos
                     st.success(f"✓ Fetched {len(filtered_videos)} videos (from {len(all_videos)} total)")
@@ -256,7 +259,37 @@ with st.sidebar:
     if st.session_state.video_list:
         export_name = st.text_input("Export name:", value="surgical_videos")
         
-        if st.button("Export as JSON"):
+        # Video export destination (placeholder)
+        st.subheader("Export Videos")
+        export_video_dir = st.text_input(
+            "Video destination directory:",
+            value="//placeholder/path/to/destination",
+            help="Destination folder for exported video files"
+        )
+        
+        if st.button("📹 Export Videos to Directory"):
+            # Check how many videos are downloaded
+            downloaded_count = sum(1 for v in st.session_state.video_list 
+                                  if os.path.exists(f"data/temp_videos/{v['filename']}"))
+            
+            if downloaded_count == 0:
+                st.warning("⚠️ No videos have been downloaded yet. Preview videos first to download them.")
+            elif export_video_dir == "//placeholder/path/to/destination":
+                st.warning("⚠️ Please update the destination directory path first")
+            else:
+                with st.spinner("Copying videos to export directory..."):
+                    exported, failed = export_videos_to_directory(st.session_state.video_list, export_video_dir)
+                    
+                    if exported > 0:
+                        st.success(f"✓ Exported {exported} videos to {export_video_dir}")
+                    if failed > 0:
+                        st.warning(f"⚠️ {failed} videos not downloaded yet or failed to copy")
+        
+        st.divider()
+        
+        # JSON export
+        st.subheader("Export Metadata")
+        if st.button("📄 Export as JSON"):
             export_data = {
                 "export_date": datetime.now().isoformat(),
                 "video_count": len(st.session_state.video_list),
@@ -293,65 +326,142 @@ if st.session_state.video_list:
     if selected_index is not None:
         selected_video = st.session_state.video_list[selected_index]
         
-        # Two column layout: video player (left 1/4) + metadata (right 3/4)
-        col1, col2 = st.columns([1, 3])
+        # Two column layout: video player (left) + metadata (right)
+        col1, col2 = st.columns([1.5, 2.5])
         
         with col1:
             st.subheader("🎥 Video Preview")
             
-            # Video stored in S3 - show location
-            st.info("Video stored in S3")
-            st.caption(f"{selected_video.get('s3_location', 'N/A')}")
+            # Check if video is downloaded locally
+            local_path = f"data/temp_videos/{selected_video['filename']}"
             
-            # Video ID (S3 key)
-            st.markdown("**Video ID:**")
-            st.markdown(f"<small>{selected_video.get('s3_key', 'N/A')}</small>", unsafe_allow_html=True)
-            
-            # Optional: Add download button for future implementation
-            if st.button("⬇️ Download from S3 (Coming soon)", disabled=True):
-                st.info("Download feature coming soon")
-        
+            if os.path.exists(local_path):
+                # Show video player
+                st.video(local_path)
+                st.success("✓ Video loaded")
+            else:
+                # Show download button
+                st.info("Video not downloaded yet")
+                
+                if st.button("⬇️ Download & Preview", key=f"download_{selected_index}"):
+                    with st.spinner("Downloading video from S3..."):
+                        if download_video_from_s3(selected_video['s3_key'], local_path):
+                            st.success("✓ Downloaded!")
+                            st.rerun()
+                    
         with col2:
             st.subheader("📋 Metadata")
             
-            # Display metadata from API
-            col_a, col_b, col_c = st.columns(3)
+            # Two column layout: labels on left, values on right
+            meta_col_label, meta_col_value = st.columns([1, 2])
             
-            with col_a:
-                st.metric("Procedure", selected_video.get('procedure_name', 'N/A'))
-                st.metric("Specialty", selected_video.get('specialties', 'N/A'))
+            # Get distinct specialties only
+            specialties = selected_video.get('specialties', 'N/A')
+            if specialties != 'N/A':
+                specialty_list = [s.strip() for s in specialties.split(',')]
+                # Remove duplicates while preserving order
+                seen = set()
+                distinct_specialties = []
+                for s in specialty_list:
+                    if s not in seen:
+                        seen.add(s)
+                        distinct_specialties.append(s)
+                specialty_display = ', '.join(distinct_specialties)
+            else:
+                specialty_display = 'N/A'
             
-            with col_b:
-                st.metric("Case Date", format_date(selected_video.get('case_date', 'N/A')))
-                st.metric("Room", selected_video.get('room', 'N/A'))
+            # Calculate video length in mm:ss format
+            duration_seconds = selected_video.get('duration_seconds', 0)
+            if duration_seconds and duration_seconds > 0:
+                minutes = int(duration_seconds // 60)
+                seconds = int(duration_seconds % 60)
+                video_length = f"{minutes}:{seconds:02d}"
+            else:
+                video_length = 'N/A'
             
-            with col_c:
-                st.metric("Upload Date", format_date(selected_video.get('upload_date', 'N/A')))
-                st.metric("EMR ID", selected_video.get('surgeon_ids', 'N/A'))
+            # Create aligned metadata table using HTML (smaller values text)
+            metadata_html = f"""
+            <table style="width:100%; border-collapse: collapse;">
+                <tr>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top; width: 25%;"><strong>Procedure:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{selected_video.get('procedure_name', 'N/A')}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>Case Date:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{format_date(selected_video.get('case_date', 'N/A'))}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>Upload Date:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{format_date(selected_video.get('upload_date', 'N/A'))}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>Video Length:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{video_length}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>Specialty:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{specialty_display}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>Room:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{selected_video.get('room', 'N/A')}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>EMR ID:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{selected_video.get('surgeon_ids', 'N/A')}</td>
+                </tr>
+            </table>
+            """
+            st.markdown(metadata_html, unsafe_allow_html=True)
             
             st.divider()
             
             # Full details in expandable section
             with st.expander("📄 Full Video Details", expanded=False):
+                # Show file size if video is downloaded
+                local_path = f"data/temp_videos/{selected_video['filename']}"
+                if os.path.exists(local_path):
+                    file_size_bytes = os.path.getsize(local_path)
+                    file_size_gb = file_size_bytes / (1024**3)  # Convert to GB
+                    st.markdown(f"**File Size:** {file_size_gb:.2f} GB")
+                    st.divider()
+                
                 st.json(selected_video)
         
-        st.divider()
-        
-        # Table view of all videos
-        st.subheader("📊 All Videos in Current Selection")
-        df = pd.DataFrame(st.session_state.video_list)
-        
-        # Format dates in dataframe
-        if 'case_date' in df.columns:
-            df['case_date'] = df['case_date'].apply(format_date)
-        if 'upload_date' in df.columns:
-            df['upload_date'] = df['upload_date'].apply(format_date)
+    st.divider()
+    
+    # Table view of all videos
+    st.subheader("📊 All Videos in Current Selection")
+    df = pd.DataFrame(st.session_state.video_list)
+    
+    # Format dates in dataframe
+    if 'case_date' in df.columns:
+        df['case_date'] = df['case_date'].apply(format_date)
+    if 'upload_date' in df.columns:
+        df['upload_date'] = df['upload_date'].apply(format_date)
+    
+        # Clean up specialties column to show only distinct values
+        if 'specialties' in df.columns:
+            def clean_specialties(spec_str):
+                if not spec_str or spec_str == 'N/A':
+                    return 'N/A'
+                specialty_list = [s.strip() for s in spec_str.split(',')]
+                # Remove duplicates while preserving order
+                seen = set()
+                distinct = []
+                for s in specialty_list:
+                    if s not in seen:
+                        seen.add(s)
+                        distinct.append(s)
+                return ', '.join(distinct)
+            
+            df['specialties'] = df['specialties'].apply(clean_specialties)
         
         # Display columns from API metadata
         display_columns = ['filename', 'procedure_name', 'case_date', 'room', 'specialties']
         available_columns = [col for col in display_columns if col in df.columns]
         
-        st.dataframe(df[available_columns], use_container_width=True, hide_index=True)
+        st.dataframe(df[available_columns], width='stretch', hide_index=True)
 
 else:
     st.info("👈 Use the sidebar to authenticate and fetch videos from Explorer API")
