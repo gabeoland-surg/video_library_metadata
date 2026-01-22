@@ -1,367 +1,357 @@
-import json
-import sqlite3
-from pathlib import Path
-from datetime import datetime
-
-import pandas as pd
 import streamlit as st
+import json
+from datetime import datetime
+import os
+import boto3
+import requests
+from dotenv import load_dotenv
+from urllib.parse import urlparse
+import pandas as pd
 
-APP_TITLE = "Video Library (Local MVP)"
-DB_PATH = Path("data/videos.db")
-MANIFEST_DIR = Path("data/manifests")
-THUMB_DIR = Path("data/thumbnails")
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
+# Load environment variables
+load_dotenv()
 
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+# Configuration from .env
+CLIENT_ID = os.getenv('CLIENT_ID')
+CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'insights-prod-media-bucket')
+AUTH_URL = os.getenv('AUTH_URL', 'https://api.accounts.surgicalsafety.com/oauth/v1/token')
+EXPLORER_API_URL = os.getenv('EXPLORER_API_URL', 'https://api.blackbox.surgicalsafety.com/api/explorer/v2/export')
 
-def get_conn():
-	DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-	return sqlite3.connect(DB_PATH)
-
-def init_db():
-	conn = get_conn()
-	cur = conn.cursor()
-	cur.execute("""
-	CREATE TABLE IF NOT EXISTS videos (
-		video_id INTEGER PRIMARY KEY AUTOINCREMENT,
-		path TEXT UNIQUE NOT NULL,
-		filename TEXT NOT NULL,
-		ext TEXT,
-		bytes INTEGER,
-		mtime REAL,
-		phi_status TEXT DEFAULT 'unknown'
-	);
-	""")
-	cur.execute("""
-	CREATE TABLE IF NOT EXISTS tags (
-		tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT UNIQUE NOT NULL
-	);
-	""")
-	cur.execute("""
-	CREATE TABLE IF NOT EXISTS video_tags (
-		video_id INTEGER NOT NULL,
-		tag_id INTEGER NOT NULL,
-		UNIQUE(video_id, tag_id)
-	);
-	""")
-
-	# --- Migration: add phi_status column if it doesn't exist yet ---
-	cur.execute("PRAGMA table_info(videos)")
-	cols = [row[1] for row in cur.fetchall()]
-	if "phi_status" not in cols:
-		cur.execute("ALTER TABLE videos ADD COLUMN phi_status TEXT DEFAULT 'unknown'")
-	else:
-		cur.execute("UPDATE videos SET phi_status='unknown' WHERE phi_status IS NULL")
-
-	conn.commit()
-	conn.close()
-
-def upsert_video(row: dict):
-	conn = get_conn()
-	cur = conn.cursor()
-	cur.execute("""
-	INSERT INTO videos (path, filename, ext, bytes, mtime)
-	VALUES (:path, :filename, :ext, :bytes, :mtime)
-	ON CONFLICT(path) DO UPDATE SET
-		filename=excluded.filename,
-		ext=excluded.ext,
-		bytes=excluded.bytes,
-		mtime=excluded.mtime
-	;
-	""", row)
-	conn.commit()
-	conn.close()
-
-def list_videos(search: str = "", tag: str | None = None):
-	conn = get_conn()
-	conn.row_factory = sqlite3.Row
-	cur = conn.cursor()
-	params = {"q": f"%{search.strip()}%"}
-	if tag and tag.strip():
-		params["tag"] = tag.strip()
-		cur.execute("""
-		SELECT v.*
-		FROM videos v
-		JOIN video_tags vt ON vt.video_id = v.video_id
-		JOIN tags t ON t.tag_id = vt.tag_id
-		WHERE (v.filename LIKE :q OR v.path LIKE :q)
-		  AND t.name = :tag
-		ORDER BY v.mtime DESC
-		""", params)
-	else:
-		cur.execute("""
-		SELECT v.*
-		FROM videos v
-		WHERE (v.filename LIKE :q OR v.path LIKE :q)
-		ORDER BY v.mtime DESC
-		""", params)
-	rows = [dict(r) for r in cur.fetchall()]
-	conn.close()
-	return rows
-
-def get_all_tags():
-	conn = get_conn()
-	conn.row_factory = sqlite3.Row
-	cur = conn.cursor()
-	cur.execute("SELECT name FROM tags ORDER BY name ASC")
-	tags = [r["name"] for r in cur.fetchall()]
-	conn.close()
-	return tags
-
-def get_video(video_id: int):
-	conn = get_conn()
-	conn.row_factory = sqlite3.Row
-	cur = conn.cursor()
-	cur.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,))
-	r = cur.fetchone()
-	conn.close()
-	return dict(r) if r else None
-
-def get_video_tags(video_id: int):
-	conn = get_conn()
-	conn.row_factory = sqlite3.Row
-	cur = conn.cursor()
-	cur.execute("""
-	SELECT t.name
-	FROM tags t
-	JOIN video_tags vt ON vt.tag_id = t.tag_id
-	WHERE vt.video_id = ?
-	ORDER BY t.name ASC
-	""", (video_id,))
-	tags = [r["name"] for r in cur.fetchall()]
-	conn.close()
-	return tags
-
-def set_video_tags(video_id: int, tag_names: list[str]):
-	tag_names = sorted({t.strip() for t in tag_names if t.strip()})
-	conn = get_conn()
-	cur = conn.cursor()
-
-	for t in tag_names:
-		cur.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (t,))
-
-	cur.execute("DELETE FROM video_tags WHERE video_id = ?", (video_id,))
-
-	if tag_names:
-		cur.execute("SELECT tag_id, name FROM tags WHERE name IN ({})".format(
-			",".join(["?"] * len(tag_names))
-		), tag_names)
-		tag_id_map = {name: tag_id for tag_id, name in cur.fetchall()}
-		for name in tag_names:
-			cur.execute("INSERT OR IGNORE INTO video_tags (video_id, tag_id) VALUES (?, ?)",
-						(video_id, tag_id_map[name]))
-
-	conn.commit()
-	conn.close()
-
-def find_videos(root: Path):
-	for p in root.rglob("*"):
-		if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
-			yield p
-
-def fmt_bytes(n):
-	if n is None:
-		return ""
-	for unit in ["B", "KB", "MB", "GB", "TB"]:
-		if n < 1024:
-			return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
-		n /= 1024
-	return f"{n:.1f} PB"
-
-def fmt_dt(ts):
-	if not ts:
-		return ""
-	return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-
-@st.cache_data(ttl=2)
-def cached_list_videos(search: str, tag: str | None):
-	return list_videos(search=search, tag=tag)
-
-
-# --- App ---
-init_db()
-MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
-THUMB_DIR.mkdir(parents=True, exist_ok=True)
-
-st.title(APP_TITLE)
-st.warning(
-	"⚠️ This video library may contain Protected Health Information (PHI). "
-	"Do not copy, upload, or share videos outside approved systems."
+# Initialize S3 client
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
+def format_date(date_str):
+    """Convert YYYY-MM-DD to MM/DD/YYYY"""
+    if not date_str or date_str == 'N/A':
+        return 'N/A'
+    try:
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        return date_obj.strftime('%m/%d/%Y')
+    except:
+        return date_str
 
+def get_auth_token():
+    """Get authentication token from Surgical Safety API"""
+    try:
+        response = requests.post(
+            url=AUTH_URL,
+            headers={
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'accept': 'application/json'
+            },
+            data={
+                'client_id': CLIENT_ID,
+                'secret': CLIENT_SECRET,
+                'grant_type': 'client_credentials'
+            }
+        )
+        response.raise_for_status()
+        return response.json()['accessToken']
+    except Exception as e:
+        st.error(f"Authentication failed: {e}")
+        return None
+
+def fetch_videos_from_explorer(start_date, end_date, token):
+    """Fetch video list from Explorer API"""
+    try:
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {token}'
+        }
+        payload = {
+            'startDate': start_date,
+            'endDate': end_date
+        }
+        
+        response = requests.post(EXPLORER_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        return response.json()
+    except Exception as e:
+        st.error(f"Error fetching videos: {e}")
+        return []
+
+def parse_video_metadata(video_data):
+    """Parse video metadata from Explorer API response"""
+    videos = []
+    
+    for case in video_data:
+        procedures = case.get('procedures', [])
+        specialties = case.get('specialties', [])
+        room = case.get('room', 'N/A')
+        case_date = case.get('caseDate', 'N/A')
+        upload_date = case.get('uploadDate', 'N/A')
+        duration = case.get('videoDurationSeconds', 0)
+        
+		# Extract users/surgeon EMR IDs (list of strings like ["EMRID1", "EMRID2"])
+        users = case.get('users', [])
+        if isinstance(users, list) and users:
+            surgeon_id_str = ', '.join(users)
+        else:
+            surgeon_id_str = 'N/A'
+        
+        # Check if users is a dictionary or list
+        if isinstance(users, dict):
+            for key, value in users.items():
+                if key.startswith('EMRID') and value:
+                    surgeon_ids.append(f"{key}: {value}")
+        elif isinstance(users, list):
+            # If users is a list, just join them
+            surgeon_ids = [str(u) for u in users if u]
+        
+        surgeon_id_str = ', '.join(surgeon_ids) if surgeon_ids else 'N/A'
+        
+        # Process each media file
+        for media in case.get('mediaFiles', []):
+            s3_location = media.get('s3Location', '')
+            start_time = media.get('startTime', 'N/A')
+            end_time = media.get('endTime', 'N/A')
+            
+            if s3_location:
+                parsed_url = urlparse(s3_location)
+                s3_key = parsed_url.path.lstrip('/')
+                path_segments = s3_key.split('/')
+                video_id = path_segments[-2] if len(path_segments) > 1 else 'unknown'
+                filename = path_segments[-1] if path_segments else 'unknown.mp4'
+            else:
+                s3_key = ''
+                video_id = 'unknown'
+                filename = 'unknown.mp4'
+            
+            videos.append({
+                'filename': filename,
+                'video_id': video_id,
+                's3_key': s3_key,
+                's3_location': s3_location,
+                'procedure_name': ', '.join(procedures) if procedures else 'N/A',
+                'specialties': ', '.join(specialties) if specialties else 'N/A',
+                'room': room,
+                'case_date': case_date,
+                'upload_date': upload_date,
+                'surgeon_ids': surgeon_id_str,
+                'users': users,  # Keep raw users dict for filtering
+                'start_time': start_time.split('T')[1] if 'T' in start_time else start_time,
+                'end_time': end_time.split('T')[1] if 'T' in end_time else end_time,
+                'duration_seconds': duration
+            })
+    
+    return videos
+
+# Initialize session state
+if 'video_list' not in st.session_state:
+    st.session_state.video_list = []
+if 'auth_token' not in st.session_state:
+    st.session_state.auth_token = None
+
+# Page config
+st.set_page_config(page_title="Surgical Video Metadata Viewer", layout="wide")
+
+st.title("🏥 Surgical Video Metadata Viewer")
+
+# Sidebar for import
 with st.sidebar:
-	st.header("Ingest")
-	root = st.text_input("Folder to index", value=r"D:/")
-	make_thumbs = st.checkbox("Generate thumbnails (slower first time)", value=True)
-	run_ingest = st.button("Index videos", use_container_width=True)
+    st.header("🔐 Authentication")
+    if st.button("Authenticate", type="primary"):
+        with st.spinner("Authenticating..."):
+            token = get_auth_token()
+            if token:
+                st.session_state.auth_token = token
+                st.success("✓ Authenticated successfully")
+            else:
+                st.error("Authentication failed")
+    
+    st.divider()
+    
+    st.header("📥 Fetch Videos from Explorer API")
+    
+    st.subheader("Filters")
+    surgeon_ids = st.text_area(
+        "Surgeon EMR IDs (one per line):",
+        placeholder="12345\n67890\n11223",
+        help="Leave empty to fetch all surgeons"
+    )
+    
+    use_case_date = st.checkbox(
+        "Filter by case date (not upload date)",
+        value=True,
+        help="When checked, date range filters by when surgery occurred, not when video was uploaded"
+    )
+    
+    st.divider()
+    
+    # Date range selection
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("Start Date", value=datetime.now().date())
+    with col2:
+        end_date = st.date_input("End Date", value=datetime.now().date())
+    
+    if st.button("Fetch Videos", disabled=not st.session_state.auth_token):
+        if not st.session_state.auth_token:
+            st.warning("Please authenticate first")
+        else:
+            with st.spinner("Fetching videos from Explorer API..."):
+                start_str = start_date.strftime('%Y-%m-%d')
+                end_str = end_date.strftime('%Y-%m-%d')
+                
+                # Parse surgeon IDs
+                surgeon_list = [s.strip() for s in surgeon_ids.split('\n') if s.strip()] if surgeon_ids else []
+                
+                video_data = fetch_videos_from_explorer(
+                    start_str, 
+                    end_str, 
+                    st.session_state.auth_token
+                )
+                
+                if video_data:
+                    all_videos = parse_video_metadata(video_data)
+                    
+					# Filter by surgeon ID if specified
+                    if surgeon_list:
+                        filtered_videos = []
+                        for v in all_videos:
+                            video_users = v.get('users', [])
+                            
+							# Check if any of the surgeon IDs match any user in the video
+                            if isinstance(video_users, list):
+                                if any(surgeon_id in video_user for surgeon_id in surgeon_list for video_user in video_users):
+                                    filtered_videos.append(v)
+                            else:
+                                filtered_videos.append(v)
 
-	st.divider()
-	st.header("Browse")
-	q = st.text_input("Search filename/path", value="")
+                            # Get user values based on type
+                            if isinstance(users, dict):
+                                user_values = [val for key, val in users.items() if key.startswith('EMRID')]
+                            elif isinstance(users, list):
+                                user_values = users
+                            else:
+                                user_values = []
+                            
+                            if any(surgeon_id in str(val) for val in user_values for surgeon_id in surgeon_list):
+                                filtered_videos.append(v)
+                    else:
+                        filtered_videos = all_videos
+                    
+                    # Filter by case date if selected
+                    if use_case_date:
+                        filtered_videos = [v for v in filtered_videos
+                                         if start_str <= v.get('case_date', '') <= end_str]
+                    
+                    st.session_state.video_list = filtered_videos
+                    st.success(f"✓ Fetched {len(filtered_videos)} videos (from {len(all_videos)} total)")
+                else:
+                    st.info("No videos found for this date range")
+    
+    st.divider()
+    
+    # Export section
+    st.header("📤 Export")
+    if st.session_state.video_list:
+        export_name = st.text_input("Export name:", value="surgical_videos")
+        
+        if st.button("Export as JSON"):
+            export_data = {
+                "export_date": datetime.now().isoformat(),
+                "video_count": len(st.session_state.video_list),
+                "videos": st.session_state.video_list
+            }
+            
+            os.makedirs("data/exports", exist_ok=True)
+            filename = f"data/exports/{export_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(filename, 'w') as f:
+                json.dump(export_data, f, indent=2)
+            
+            st.success(f"✓ Exported to: {filename}")
+            
+            st.download_button(
+                label="⬇️ Download JSON",
+                data=json.dumps(export_data, indent=2),
+                file_name=f"{export_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
 
-	phi_opts = ["(any)", "unknown", "suspected", "cleared"]
-	phi_choice = st.selectbox("Filter by PHI status", options=phi_opts, index=0)
+# Main content area
+if st.session_state.video_list:
+    st.subheader(f"📹 Video List ({len(st.session_state.video_list)} videos)")
+    
+    # Select video from list
+    video_options = [f"{i+1}. {v['filename']} - {v['procedure_name']}" 
+                     for i, v in enumerate(st.session_state.video_list)]
+    selected_index = st.selectbox(
+        "Select a video to preview:",
+        range(len(video_options)),
+        format_func=lambda x: video_options[x]
+    )
+    
+    if selected_index is not None:
+        selected_video = st.session_state.video_list[selected_index]
+        
+        # Two column layout: video player (left 1/4) + metadata (right 3/4)
+        col1, col2 = st.columns([1, 3])
+        
+        with col1:
+            st.subheader("🎥 Video Preview")
+            
+            # Video stored in S3 - show location
+            st.info("Video stored in S3")
+            st.caption(f"{selected_video.get('s3_location', 'N/A')}")
+            
+            # Video ID (S3 key)
+            st.markdown("**Video ID:**")
+            st.markdown(f"<small>{selected_video.get('s3_key', 'N/A')}</small>", unsafe_allow_html=True)
+            
+            # Optional: Add download button for future implementation
+            if st.button("⬇️ Download from S3 (Coming soon)", disabled=True):
+                st.info("Download feature coming soon")
+        
+        with col2:
+            st.subheader("📋 Metadata")
+            
+            # Display metadata from API
+            col_a, col_b, col_c = st.columns(3)
+            
+            with col_a:
+                st.metric("Procedure", selected_video.get('procedure_name', 'N/A'))
+                st.metric("Specialty", selected_video.get('specialties', 'N/A'))
+            
+            with col_b:
+                st.metric("Case Date", format_date(selected_video.get('case_date', 'N/A')))
+                st.metric("Room", selected_video.get('room', 'N/A'))
+            
+            with col_c:
+                st.metric("Upload Date", format_date(selected_video.get('upload_date', 'N/A')))
+                st.metric("EMR ID", selected_video.get('surgeon_ids', 'N/A'))
+            
+            st.divider()
+            
+            # Full details in expandable section
+            with st.expander("📄 Full Video Details", expanded=False):
+                st.json(selected_video)
+        
+        st.divider()
+        
+        # Table view of all videos
+        st.subheader("📊 All Videos in Current Selection")
+        df = pd.DataFrame(st.session_state.video_list)
+        
+        # Format dates in dataframe
+        if 'case_date' in df.columns:
+            df['case_date'] = df['case_date'].apply(format_date)
+        if 'upload_date' in df.columns:
+            df['upload_date'] = df['upload_date'].apply(format_date)
+        
+        # Display columns from API metadata
+        display_columns = ['filename', 'procedure_name', 'case_date', 'room', 'specialties']
+        available_columns = [col for col in display_columns if col in df.columns]
+        
+        st.dataframe(df[available_columns], use_container_width=True, hide_index=True)
 
-	tags = ["(any)"] + get_all_tags()
-	tag_choice = st.selectbox("Filter by tag", options=tags, index=0)
-
-	st.divider()
-	st.header("Export")
-	export_tag = st.selectbox("Manifest tag filter", options=["(any)"] + get_all_tags(), index=0)
-	exclude_suspected = st.checkbox("Exclude suspected PHI (recommended)", value=True)
-	preview_btn = st.button("Preview manifest", use_container_width=True)
-	export_btn = st.button("Export manifest.json", use_container_width=True)
-
-
-if run_ingest:
-	root_path = Path(root)
-	if not root_path.exists():
-		st.error("Folder not found.")
-	else:
-		vids = list(find_videos(root_path))
-		st.info(f"Found {len(vids)} videos. Indexing…")
-		prog = st.progress(0)
-		for i, p in enumerate(vids, start=1):
-			try:
-				stat = p.stat()
-				upsert_video({
-					"path": str(p.resolve()),
-					"filename": p.name,
-					"ext": p.suffix.lower(),
-					"bytes": int(stat.st_size),
-					"mtime": float(stat.st_mtime),
-				})
-			except Exception as e:
-				st.warning(f"Failed: {p} — {e}")
-			prog.progress(i / max(len(vids), 1))
-		st.success("Done indexing.")
-
-tag_filter = None if tag_choice == "(any)" else tag_choice
-rows = cached_list_videos(search=q, tag=tag_filter)
-if phi_choice != "(any)":
-	rows = [r for r in rows if (r.get("phi_status") or "unknown") == phi_choice]
-df = pd.DataFrame(rows)
-
-left, right = st.columns([1.25, 1])
-
-with left:
-	st.subheader("Library")
-	if df.empty:
-		st.write("No videos indexed yet. Use the sidebar to index a folder.")
-		selected_id = None
-	else:
-		view = df.copy()
-		view["size"] = view["bytes"].apply(fmt_bytes)
-		view["modified"] = view["mtime"].apply(fmt_dt)
-
-		# Tags column (comma-separated)
-		tag_map = {}
-		for r in rows:
-			tag_map[r["video_id"]] = get_video_tags(r["video_id"])
-		view["tags"] = view["video_id"].map(lambda vid: ", ".join(tag_map.get(vid, [])))
-
-		# Ensure phi_status shows up even if missing
-		if "phi_status" not in view.columns:
-			view["phi_status"] = "unknown"
-
-		view = view[["video_id", "phi_status", "tags", "filename", "ext", "size", "modified", "path"]]
-
-		event = st.dataframe(
-			view,
-			use_container_width=True,
-			hide_index=True,
-			on_select="rerun",
-			selection_mode="single-row",
-		)
-
-		selected_id = int(view["video_id"].iloc[0])
-
-		if event and event.selection and event.selection.get("rows"):
-			row_idx = event.selection["rows"][0]
-			selected_id = int(view.iloc[row_idx]["video_id"])
-
-		st.caption(f"Selected video_id: {selected_id}")
-
-with right:
-	st.subheader("Video Detail")
-	if not selected_id:
-		st.write("Index videos first.")
-	else:
-		vid = get_video(int(selected_id))
-		if not vid:
-			st.write("Pick a valid video ID.")
-		else:
-			st.write(f"**{vid['filename']}**")
-			st.caption(vid["path"])
-
-			p = Path(vid["path"])
-			if p.exists():
-				if st.button("Load video", use_container_width=True):
-					st.video(str(p))
-				else:
-					st.info("Click **Load video** to open the player (prevents slow auto-load).")
-			else:
-				st.warning("File not found (moved/deleted?).")
-		
-	st.write("**PHI status**")
-	status_options = ["unknown", "suspected", "cleared"]
-	current_status = vid.get("phi_status") or "unknown"
-	new_status = st.selectbox("Set PHI status", status_options, index=status_options.index(current_status))
-
-	if st.button("Save PHI status", use_container_width=True):
-		conn = get_conn()
-		cur = conn.cursor()
-		cur.execute("UPDATE videos SET phi_status=? WHERE video_id=?", (new_status, vid["video_id"]))
-		conn.commit()
-		conn.close()
-		st.success("PHI status saved.")
-
-	st.write("**Tags**")
-	current = get_video_tags(vid["video_id"])
-	all_tags = get_all_tags()
-	new_tags = st.multiselect("Select tags", options=all_tags, default=current)
-
-	add = st.text_input("Add a new tag")
-	if add.strip():
-		new_tags = sorted(set(new_tags + [add.strip()]))
-
-	if st.button("Save tags", use_container_width=True):
-		set_video_tags(vid["video_id"], new_tags)
-		st.success("Saved.")
-
-if preview_btn or export_btn:
-	export_tag_filter = None if export_tag == "(any)" else export_tag
-	export_rows = list_videos(search="", tag=export_tag_filter)
-
-	if exclude_suspected:
-		export_rows = [r for r in export_rows if (r.get("phi_status") or "unknown") != "suspected"]
-
-	manifest = {
-		"created_at": datetime.now().isoformat(),
-		"filter_tag": export_tag_filter,
-		"exclude_suspected_phi": exclude_suspected,
-		"count": len(export_rows),
-		"videos": [
-			{
-				"video_id": r["video_id"],
-				"path": r["path"],
-				"filename": r["filename"],
-				"phi_status": r.get("phi_status", "unknown"),
-				"tags": get_video_tags(r["video_id"]),
-				"bytes": r.get("bytes"),
-				"mtime": r.get("mtime"),
-			}
-			for r in export_rows
-		],
-	}
-
-	if preview_btn:
-		st.subheader("Manifest preview")
-		st.json(manifest)
-
-	if export_btn:
-		out = MANIFEST_DIR / f"manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-		out.write_text(json.dumps(manifest, indent=2))
-		st.success(f"Exported: {out}")
+else:
+    st.info("👈 Use the sidebar to authenticate and fetch videos from Explorer API")
