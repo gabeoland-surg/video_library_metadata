@@ -54,4 +54,8 @@ Thumbs.db
 # Environment variables
 .env
 
+# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+# Surgeon configuration (sensitive)
+surgeon_config.py

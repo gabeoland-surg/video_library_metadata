@@ -28,6 +28,14 @@ s3_client = boto3.client(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
+# Import surgeon IDs from separate config file (not tracked in Git)
+try:
+    from surgeon_config import MY_SURGEON_IDS
+except ImportError:
+    # Fallback if config file doesn't exist
+    MY_SURGEON_IDS = []
+    st.warning("⚠️ surgeon_config.py not found. Create this file to enable surgeon filtering.")
+
 def format_date(date_str):
     """Convert YYYY-MM-DD to MM/DD/YYYY"""
     if not date_str or date_str == 'N/A':
@@ -125,7 +133,6 @@ def parse_video_metadata(video_data):
                 'room': room,
                 'case_date': case_date,
                 'upload_date': upload_date,
-                'surgeon_ids': surgeon_id_str,
                 'users': users,  # Keep raw users list for filtering
                 'start_time': start_time.split('T')[1] if 'T' in start_time else start_time,
                 'end_time': end_time.split('T')[1] if 'T' in end_time else end_time,
@@ -133,6 +140,117 @@ def parse_video_metadata(video_data):
             })
     
     return videos
+
+def group_related_videos(videos):
+    """
+    Group videos that are part of the same procedure.
+    Videos are grouped if they share: procedure, room, surgeons, case date.
+    This handles multiple camera feeds (V1, V2, V3) of the same procedure.
+    """
+    if not videos:
+        return []
+    
+    # Sort by case date, procedure, and room
+    sorted_videos = sorted(videos, key=lambda v: (
+        v.get('case_date', ''),
+        v.get('procedure_name', ''),
+        v.get('room', ''),
+        v.get('start_time', '')
+    ))
+    
+    grouped = []
+    current_group = [sorted_videos[0]]
+    
+    for i in range(1, len(sorted_videos)):
+        current = sorted_videos[i]
+        previous = sorted_videos[i-1]
+        
+        # Check if videos should be grouped (same procedure instance)
+        same_procedure = current.get('procedure_name') == previous.get('procedure_name')
+        same_room = current.get('room') == previous.get('room')
+        same_case_date = current.get('case_date') == previous.get('case_date')
+        same_surgeons = current.get('users') == previous.get('users')
+        
+        # Check if videos overlap or are sequential within 60 minutes
+        # Compare current video's start time to previous video's END time
+        time_close = False
+        try:
+            prev_end = previous.get('end_time', '')
+            curr_start = current.get('start_time', '')
+            
+            if prev_end and curr_start:
+                # Handle both full ISO format and time-only format
+                if 'T' in prev_end and 'T' in curr_start:
+                    from datetime import datetime
+                    prev_end_dt = datetime.fromisoformat(prev_end)
+                    curr_start_dt = datetime.fromisoformat(curr_start)
+                    
+                    # Time difference in minutes (can be negative if overlapping/simultaneous)
+                    time_diff = (curr_start_dt - prev_end_dt).total_seconds() / 60
+                    
+                    # Group if current starts within 60 minutes after previous ends
+                    # OR if they overlap (negative time_diff means simultaneous/overlapping)
+                    time_close = time_diff <= 60
+                else:
+                    # If time parsing doesn't work, allow grouping
+                    time_close = True
+        except Exception as e:
+            # If time parsing fails, still allow grouping based on other criteria
+            time_close = True
+        
+        # If all criteria match, add to current group
+        if same_procedure and same_room and same_case_date and same_surgeons and time_close:
+            current_group.append(current)
+        else:
+            # Finalize current group and start new one
+            grouped.append(current_group)
+            current_group = [current]
+    
+    # Add the last group
+    grouped.append(current_group)
+    
+    # Convert groups to combined video entries
+    combined_videos = []
+    for group in grouped:
+        if len(group) == 1:
+            # Single video, keep as is
+            combined_videos.append(group[0])
+        else:
+            # Multiple videos (feeds), create combined entry
+            combined = group[0].copy()
+            
+            # Identify feed types from filenames
+            feed_names = []
+            for v in group:
+                filename = v.get('filename', '')
+                # Extract feed name (e.g., "49V1.mp4" -> "V1")
+                if 'V' in filename:
+                    feed = filename.split('.')[0][-2:]  # Get last 2 chars before extension
+                    feed_names.append(feed)
+                else:
+                    feed_names.append('?')
+            
+            # Combine info
+            combined['is_concatenated'] = True
+            combined['segment_count'] = len(group)
+            combined['segments'] = group  # Store all segments
+            combined['feed_names'] = feed_names
+            combined['filename'] = f"{group[0]['procedure_name'][:30]}... ({', '.join(feed_names)})"
+            
+            # Use earliest start and latest end time
+            all_start_times = [v.get('start_time', '') for v in group if v.get('start_time')]
+            all_end_times = [v.get('end_time', '') for v in group if v.get('end_time')]
+            combined['start_time'] = min(all_start_times) if all_start_times else 'N/A'
+            combined['end_time'] = max(all_end_times) if all_end_times else 'N/A'
+            
+            # Sum durations (though they might overlap if simultaneous feeds)
+            # Use max duration instead of sum for simultaneous feeds
+            durations = [v.get('duration_seconds', 0) for v in group]
+            combined['duration_seconds'] = max(durations) if durations else 0
+            
+            combined_videos.append(combined)
+    
+    return combined_videos
 
 def download_video_from_s3(s3_key, local_path):
     """Download video from S3 to local path"""
@@ -155,15 +273,27 @@ def export_videos_to_directory(video_list, destination_dir):
     
     for video in video_list:
         try:
-            local_path = f"data/temp_videos/{video['filename']}"
-            if os.path.exists(local_path):
-                dest_path = os.path.join(destination_dir, video['filename'])
-                shutil.copy2(local_path, dest_path)
-                exported += 1
+            # Handle concatenated videos (multiple segments)
+            if video.get('is_concatenated', False):
+                for segment in video.get('segments', []):
+                    local_path = f"data/temp_videos/{segment['s3_key'].replace('/', '_')}"
+                    if os.path.exists(local_path):
+                        dest_path = os.path.join(destination_dir, segment['filename'])
+                        shutil.copy2(local_path, dest_path)
+                        exported += 1
+                    else:
+                        failed += 1
             else:
-                failed += 1
+                # Single video
+                local_path = f"data/temp_videos/{video['s3_key'].replace('/', '_')}"
+                if os.path.exists(local_path):
+                    dest_path = os.path.join(destination_dir, video['filename'])
+                    shutil.copy2(local_path, dest_path)
+                    exported += 1
+                else:
+                    failed += 1
         except Exception as e:
-            st.error(f"Error copying {video['filename']}: {e}")
+            st.error(f"Error copying {video.get('filename', 'unknown')}: {e}")
             failed += 1
     
     return exported, failed
@@ -196,11 +326,20 @@ with st.sidebar:
     st.header("📥 Fetch Videos from Explorer API")
     
     st.subheader("Filters")
-    surgeon_ids = st.text_area(
-        "Surgeon EMR IDs (one per line):",
-        placeholder="EMRID1\nEMRID2\nEMRID3",
-        help="Leave empty to fetch all surgeons"
+    
+    # Toggle between "My Surgeons" and "All Surgeons"
+    filter_mode = st.radio(
+        "Surgeon Filter:",
+        options=["My Surgeons Only", "All Surgeons"],
+        help="My Surgeons: Show only videos from your configured 6 surgeons"
     )
+    
+    # Store filter mode in session state so it's accessible in metadata display
+    st.session_state.filter_mode = filter_mode
+
+    # Show which surgeons are configured
+    if filter_mode == "My Surgeons Only":
+        st.info(f"Filtering by {len(MY_SURGEON_IDS)} configured surgeons")
     
     st.divider()
     
@@ -219,9 +358,6 @@ with st.sidebar:
                 start_str = start_date.strftime('%Y-%m-%d')
                 end_str = end_date.strftime('%Y-%m-%d')
                 
-                # Parse surgeon IDs
-                surgeon_list = [s.strip() for s in surgeon_ids.split('\n') if s.strip()] if surgeon_ids else []
-                
                 video_data = fetch_videos_from_explorer(
                     start_str, 
                     end_str, 
@@ -231,26 +367,38 @@ with st.sidebar:
                 if video_data:
                     all_videos = parse_video_metadata(video_data)
                     
-                    # Filter by surgeon ID if specified
-                    if surgeon_list:
+                    # Filter by case date first
+                    all_videos = [v for v in all_videos
+                                 if start_str <= v.get('case_date', '') <= end_str]
+                    
+                    # Group related videos (concatenate multi-feed procedures)
+                    original_count = len(all_videos)
+                    all_videos = group_related_videos(all_videos)
+                    grouped_count = len(all_videos)
+
+                    # Apply surgeon filter based on mode
+                    if filter_mode == "My Surgeons Only":
                         filtered_videos = []
                         for v in all_videos:
                             video_users = v.get('users', [])
-                            # Check if any of the surgeon IDs match any user in the video
                             if isinstance(video_users, list):
-                                if any(surgeon_id in video_users for surgeon_id in surgeon_list):
+                                if any(surgeon_id in video_users for surgeon_id in MY_SURGEON_IDS):
                                     filtered_videos.append(v)
+                        
+                        # Count total video files in filtered procedures
+                        my_video_count = sum(v.get('segment_count', 1) for v in filtered_videos)
+                        all_video_count = sum(v.get('segment_count', 1) for v in all_videos)
+                        
+                        st.success(f"✓ My Surgeons: {len(filtered_videos)} operations ({my_video_count} videos) | All Surgeons: {len(all_videos)} operations ({all_video_count} videos)")
                     else:
                         filtered_videos = all_videos
-                    
-                    # Always filter by case date
-                    filtered_videos = [v for v in filtered_videos
-                                     if start_str <= v.get('case_date', '') <= end_str]
+                        
+                        # Count total video files
+                        total_video_files = sum(v.get('segment_count', 1) for v in filtered_videos)
+                        
+                        st.success(f"✓ Fetched {len(filtered_videos)} operations ({total_video_files} videos) from all surgeons")
                     
                     st.session_state.video_list = filtered_videos
-                    st.success(f"✓ Fetched {len(filtered_videos)} videos (from {len(all_videos)} total)")
-                else:
-                    st.info("No videos found for this date range")
     
     st.divider()
     
@@ -332,23 +480,48 @@ if st.session_state.video_list:
         with col1:
             st.subheader("🎥 Video Preview")
             
-            # Check if video is downloaded locally
-            local_path = f"data/temp_videos/{selected_video['filename']}"
-            
-            if os.path.exists(local_path):
-                # Show video player
-                st.video(local_path)
-                st.success("✓ Video loaded")
-            else:
-                # Show download button
-                st.info("Video not downloaded yet")
+            # Check if this is a concatenated video (multiple feeds)
+            if selected_video.get('is_concatenated', False):
+                feed_names = selected_video.get('feed_names', [])
+                st.info(f"📹 Multiple Feeds: {', '.join(feed_names)} ({selected_video['segment_count']} videos)")
                 
-                if st.button("⬇️ Download & Preview", key=f"download_{selected_index}"):
-                    with st.spinner("Downloading video from S3..."):
-                        if download_video_from_s3(selected_video['s3_key'], local_path):
-                            st.success("✓ Downloaded!")
-                            st.rerun()
+                # Show each feed
+                for idx, segment in enumerate(selected_video.get('segments', []), 1):
+                    feed_name = feed_names[idx-1] if idx-1 < len(feed_names) else f"Feed {idx}"
+                    st.markdown(f"**{feed_name}:** {segment['filename']}")
+                    # Use S3 key to create unique local path
+                    local_path = f"data/temp_videos/{segment['s3_key'].replace('/', '_')}"
                     
+                    if os.path.exists(local_path):
+                        st.video(local_path)
+                    else:
+                        if st.button(f"⬇️ Download Segment {idx}", key=f"download_seg_{selected_index}_{idx}"):
+                            with st.spinner(f"Downloading segment {idx}..."):
+                                if download_video_from_s3(segment['s3_key'], local_path):
+                                    st.success(f"✓ Downloaded segment {idx}")
+                                    st.video(local_path)
+            else:
+                # Single video (not concatenated)
+                # Use S3 key to create unique local path
+                local_path = f"data/temp_videos/{selected_video['s3_key'].replace('/', '_')}"
+                
+                # Always show which video should be playing
+                st.caption(f"**File:** {selected_video['filename']}")
+                
+                if os.path.exists(local_path):
+                    # Video is downloaded, show player
+                    st.video(local_path)
+                    st.success("✓ Video loaded")
+                else:
+                    # Video not downloaded yet
+                    st.warning("⚠️ Video not downloaded - click below")
+                    
+                    if st.button("⬇️ Download & Preview", key=f"download_{selected_index}"):
+                        with st.spinner("Downloading video from S3..."):
+                            if download_video_from_s3(selected_video['s3_key'], local_path):
+                                st.success("✓ Downloaded!")
+                                st.rerun()
+                                
         with col2:
             st.subheader("📋 Metadata")
             
@@ -378,12 +551,28 @@ if st.session_state.video_list:
                 video_length = f"{minutes}:{seconds:02d}"
             else:
                 video_length = 'N/A'
+
+            # Determine what to show for EMR ID based on filter mode
+            filter_mode = st.session_state.get('filter_mode', 'All Surgeons')
+            video_users = selected_video.get('users', [])
             
+            if filter_mode == "My Surgeons Only":
+                # Show only the surgeons that match MY_SURGEON_IDS
+                if isinstance(video_users, list):
+                    matching_surgeons = [user for user in video_users if user in MY_SURGEON_IDS]
+                    emr_display = ', '.join(matching_surgeons) if matching_surgeons else 'N/A'
+                else:
+                    emr_display = 'N/A'
+            else:
+                # All Surgeons mode - hide identity for privacy
+                emr_display = '[Protected]'
+
+
             # Create aligned metadata table using HTML (smaller values text)
             metadata_html = f"""
             <table style="width:100%; border-collapse: collapse;">
                 <tr>
-                    <td style="padding: 8px 16px 8px 0; vertical-align: top; width: 25%;"><strong>Procedure:</strong></td>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top; width: 20%;"><strong>Procedure:</strong></td>
                     <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{selected_video.get('procedure_name', 'N/A')}</td>
                 </tr>
                 <tr>
@@ -407,8 +596,8 @@ if st.session_state.video_list:
                     <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{selected_video.get('room', 'N/A')}</td>
                 </tr>
                 <tr>
-                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>EMR ID:</strong></td>
-                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{selected_video.get('surgeon_ids', 'N/A')}</td>
+                    <td style="padding: 8px 16px 8px 0; vertical-align: top;"><strong>Relevant User:</strong></td>
+                    <td style="padding: 8px 0; vertical-align: top; font-size: 0.9em;">{emr_display}</td>
                 </tr>
             </table>
             """
@@ -458,7 +647,7 @@ if st.session_state.video_list:
             df['specialties'] = df['specialties'].apply(clean_specialties)
         
         # Display columns from API metadata
-        display_columns = ['filename', 'procedure_name', 'case_date', 'room', 'specialties']
+        display_columns = ['filename', 'procedure_name', 'case_date', 'start_time','room', 'specialties']
         available_columns = [col for col in display_columns if col in df.columns]
         
         st.dataframe(df[available_columns], width='stretch', hide_index=True)
